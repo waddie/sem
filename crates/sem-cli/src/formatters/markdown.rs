@@ -179,6 +179,9 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
     if result.reordered_count > 0 {
         parts.push(format!("{} reordered", result.reordered_count));
     }
+    if result.orphan_count > 0 {
+        parts.push(format!("{} orphan", result.orphan_count));
+    }
 
     let files_label = if result.file_count == 1 {
         "file"

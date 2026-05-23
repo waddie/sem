@@ -68,7 +68,69 @@ fn split_on_separator(args: Vec<String>) -> (Vec<String>, Vec<String>) {
     }
 }
 
-fn parse_args(args: Vec<String>) -> ParsedArgs {
+/// Simple glob matching for pathspecs. Supports `*` (any chars except `/`),
+/// `**` (any chars including `/`), and `?` (one non-`/` char).
+fn glob_match(pattern: &str, path: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = path.chars().collect();
+    glob_match_inner(&pat, &text)
+}
+
+fn glob_match_inner(pat: &[char], text: &[char]) -> bool {
+    if pat.is_empty() {
+        return text.is_empty();
+    }
+
+    // Handle ** (matches any chars including /)
+    if pat.len() >= 2 && pat[0] == '*' && pat[1] == '*' {
+        let rest = if pat.len() > 2 && pat[2] == '/' {
+            &pat[3..]
+        } else {
+            &pat[2..]
+        };
+        // Try matching ** against 0..n chars
+        for i in 0..=text.len() {
+            if glob_match_inner(rest, &text[i..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Handle * (matches any chars except /)
+    if pat[0] == '*' {
+        for i in 0..=text.len() {
+            if i > 0 && text[i - 1] == '/' {
+                break;
+            }
+            if glob_match_inner(&pat[1..], &text[i..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Handle ? (matches one non-/ char)
+    if pat[0] == '?' {
+        return !text.is_empty() && text[0] != '/' && glob_match_inner(&pat[1..], &text[1..]);
+    }
+
+    // Literal character
+    !text.is_empty() && pat[0] == text[0] && glob_match_inner(&pat[1..], &text[1..])
+}
+
+/// Check if a file path matches a pathspec (supports prefix matching and basic globs).
+fn path_matches_spec(file_path: &str, spec: &str) -> bool {
+    if spec.contains('*') || spec.contains('?') || spec.contains('[') {
+        glob_match(spec, file_path)
+    } else if spec.ends_with('/') {
+        file_path.starts_with(spec.trim_end_matches('/'))
+    } else {
+        file_path == spec || file_path.starts_with(&format!("{spec}/"))
+    }
+}
+
+fn parse_args(args: Vec<String>, cwd: &str) -> ParsedArgs {
     let (refs, pathspecs) = split_on_separator(args);
 
     if refs.is_empty() {
@@ -109,7 +171,17 @@ fn parse_args(args: Vec<String>) -> ParsedArgs {
         }
 
         // If it exists as a file or directory on disk, treat as pathspec
-        if Path::new(arg).exists() {
+        if Path::new(cwd).join(arg).exists() {
+            let mut pathspecs = pathspecs;
+            pathspecs.push(arg.clone());
+            return ParsedArgs {
+                scope: None,
+                pathspecs,
+            };
+        }
+
+        // If the arg contains glob meta-characters, treat as pathspec
+        if arg.contains('*') || arg.contains('?') || arg.contains('[') {
             let mut pathspecs = pathspecs;
             pathspecs.push(arg.clone());
             return ParsedArgs {
@@ -130,7 +202,7 @@ fn parse_args(args: Vec<String>) -> ParsedArgs {
         let b = &refs[1];
 
         // If both exist as files on disk and no pathspecs, treat as file comparison
-        if pathspecs.is_empty() && Path::new(a).exists() && Path::new(b).exists() {
+        if pathspecs.is_empty() && Path::new(cwd).join(a).exists() && Path::new(cwd).join(b).exists() {
             // But check if they're also valid git refs — prefer ref interpretation
             // Only fall back to file comparison if neither resolves as a ref
             return ParsedArgs {
@@ -272,7 +344,7 @@ pub fn diff_command(mut opts: DiffOptions) {
     let total_start = Instant::now();
 
     let t0 = Instant::now();
-    let mut parsed = parse_args(std::mem::take(&mut opts.args));
+    let mut parsed = parse_args(std::mem::take(&mut opts.args), &opts.cwd);
 
     // Resolve jj revsets to git SHAs if we're in a jj repo
     let root = Path::new(&opts.cwd);
@@ -320,8 +392,8 @@ pub fn diff_command(mut opts: DiffOptions) {
         (changes, true)
     } else if let Some(ParsedScope::FileCompare(ref a, ref b)) = parsed.scope {
         // Compare two arbitrary files: sem diff file1.ts file2.ts
-        let path_a = Path::new(a);
-        let path_b = Path::new(b);
+        let path_a = Path::new(&opts.cwd).join(a);
+        let path_b = Path::new(&opts.cwd).join(b);
 
         // If we're in a git repo and both resolve as refs, prefer ref comparison
         if let Ok(git) = GitBridge::open(Path::new(&opts.cwd)) {
@@ -342,11 +414,11 @@ pub fn diff_command(mut opts: DiffOptions) {
             }
         }
 
-        let content_a = std::fs::read_to_string(path_a).unwrap_or_else(|e| {
+        let content_a = std::fs::read_to_string(&path_a).unwrap_or_else(|e| {
             eprintln!("\x1b[31mError reading {}: {e}\x1b[0m", path_a.display());
             process::exit(1);
         });
-        let content_b = std::fs::read_to_string(path_b).unwrap_or_else(|e| {
+        let content_b = std::fs::read_to_string(&path_b).unwrap_or_else(|e| {
             eprintln!("\x1b[31mError reading {}: {e}\x1b[0m", path_b.display());
             process::exit(1);
         });
@@ -369,6 +441,18 @@ pub fn diff_command(mut opts: DiffOptions) {
                 process::exit(1);
             });
         let changes = parse_unified_diff(&input, &opts.cwd);
+        let changes = if parsed.pathspecs.is_empty() {
+            changes
+        } else {
+            changes
+                .into_iter()
+                .filter(|fc| {
+                    parsed.pathspecs.iter().any(|spec| {
+                        path_matches_spec(&fc.file_path, spec)
+                    })
+                })
+                .collect()
+        };
         (changes, true)
     } else {
         let git = match GitBridge::open(Path::new(&opts.cwd)) {
