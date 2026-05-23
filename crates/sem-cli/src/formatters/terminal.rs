@@ -288,6 +288,9 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                 .to_string(),
         );
     }
+    if result.orphan_count > 0 {
+        parts.push(format!("{} orphan", result.orphan_count).dimmed().to_string());
+    }
 
     let files_label = if result.file_count == 1 {
         "file"
