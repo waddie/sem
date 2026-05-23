@@ -53,16 +53,64 @@ pub fn find_supported_files_public(root: &Path, registry: &ParserRegistry, ext_f
     find_supported_files(root, registry, ext_filter)
 }
 
+/// File names that are always excluded from graph/index (lockfiles, generated content).
+const DEFAULT_EXCLUDED_FILES: &[&str] = &[
+    "Cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "Gemfile.lock",
+    "Pipfile.lock",
+    "poetry.lock",
+    "composer.lock",
+    "go.sum",
+    "flake.lock",
+];
+
+/// Directory names that are always excluded from graph/index (fixtures, benchmarks, vendor).
+const DEFAULT_EXCLUDED_DIRS: &[&str] = &[
+    "fixtures",
+    "fixture",
+    "benchmarks",
+    "vendor",
+    "node_modules",
+    "test-harness",
+];
+
+fn is_default_excluded(rel_path: &str) -> bool {
+    // Check file name
+    if let Some(file_name) = rel_path.rsplit('/').next() {
+        if DEFAULT_EXCLUDED_FILES.contains(&file_name) {
+            return true;
+        }
+    }
+    // Check directory components
+    for component in rel_path.split('/') {
+        if DEFAULT_EXCLUDED_DIRS.contains(&component) {
+            return true;
+        }
+    }
+    false
+}
+
 fn find_supported_files(root: &Path, registry: &ParserRegistry, ext_filter: &[String]) -> Vec<String> {
     let mut files = Vec::new();
 
-    // Use the `ignore` crate to walk the filesystem respecting .gitignore
-    let walker = ignore::WalkBuilder::new(root)
+    // Use the `ignore` crate to walk the filesystem respecting .gitignore and .semignore
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
         .hidden(true)       // skip hidden files/dirs
         .git_ignore(true)   // respect .gitignore
         .git_global(true)   // respect global gitignore
-        .git_exclude(true)  // respect .git/info/exclude
-        .build();
+        .git_exclude(true); // respect .git/info/exclude
+
+    // Respect .semignore if present
+    let semignore = root.join(".semignore");
+    if semignore.exists() {
+        builder.add_ignore(semignore);
+    }
+
+    let walker = builder.build();
 
     for entry in walker.flatten() {
         let path = entry.path();
@@ -71,6 +119,9 @@ fn find_supported_files(root: &Path, registry: &ParserRegistry, ext_filter: &[St
         }
         if let Ok(rel) = path.strip_prefix(root) {
             let rel_str = rel.to_string_lossy().to_string();
+            if is_default_excluded(&rel_str) {
+                continue;
+            }
             if !ext_filter.is_empty() && !ext_filter.iter().any(|ext| rel_str.ends_with(ext.as_str())) {
                 continue;
             }

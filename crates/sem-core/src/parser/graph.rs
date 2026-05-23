@@ -541,9 +541,10 @@ impl EntityGraph {
             .map(|e| e.id.as_str())
             .collect();
 
-        // Keep edges where:
-        // - Both endpoints are clean files AND from_entity is not affected, OR
-        // - From a content_clean stale entity whose targets are also clean/content_clean
+        // Keep edges where both endpoints are in clean (non-stale) files and from_entity
+        // is not affected by target changes. Drop ALL cached edges from stale-file entities
+        // (even content_clean ones) because import/scope context may have changed even when
+        // entity content didn't. See: https://github.com/Ataraxy-Labs/sem/issues/116
         let kept_edges: Vec<EntityRef> = cached_edges
             .into_iter()
             .filter(|e| {
@@ -551,27 +552,21 @@ impl EntityGraph {
                 let to_stale = stale_entity_ids.contains(e.to_entity.as_str());
 
                 if !from_stale && !to_stale && !affected_clean_ids.contains(&e.from_entity) {
-                    // Both clean, from not affected
-                    return true;
-                }
-                if content_clean_ids.contains(&e.from_entity)
-                    && !truly_changed_ids.contains(&e.to_entity)
-                    && !deleted_ids.contains(e.to_entity.as_str())
-                    && !affected_clean_ids.contains(&e.from_entity)
-                {
-                    // From content_clean stale entity, target not truly changed
+                    // Both endpoints in clean files, from not affected
                     return true;
                 }
                 false
             })
             .collect();
 
-        // Set of entity IDs that need resolution: truly_changed + affected clean
-        // (content_clean stale entities keep their cached edges)
+        // Set of entity IDs that need resolution: all stale-file entities + affected clean.
+        // Content-clean stale entities must be re-resolved because import/scope context
+        // may have changed even if entity body content is identical.
         let needs_resolution: HashSet<&str> = all_entities
             .iter()
             .filter(|e| {
                 truly_changed_ids.contains(&e.id)
+                    || content_clean_ids.contains(&e.id)
                     || affected_clean_ids.contains(&e.id)
             })
             .map(|e| e.id.as_str())

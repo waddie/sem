@@ -70,6 +70,10 @@ enum Commands {
         #[arg(long, default_value = "terminal")]
         format: OutputFormat,
 
+        /// Shorthand for --format json
+        #[arg(long)]
+        json: bool,
+
         /// Show inline content diffs for each entity
         #[arg(long, short = 'v')]
         verbose: bool,
@@ -312,6 +316,7 @@ fn main() {
             patch,
             verbose,
             format,
+            json,
             profile,
             file_exts,
             color,
@@ -326,9 +331,11 @@ fn main() {
                     .to_string()
             });
 
+            let effective_format = if json { OutputFormat::Json } else { format };
+
             diff_command(DiffOptions {
                 cwd,
-                format,
+                format: effective_format,
                 staged: staged || cached,
                 commit,
                 from,

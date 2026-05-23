@@ -30,7 +30,7 @@ pub fn build_entity_id(
     parent_id: Option<&str>,
 ) -> String {
     match parent_id {
-        Some(pid) => format!("{file_path}::{pid}::{name}"),
+        Some(pid) => format!("{pid}::{name}"),
         None => format!("{file_path}::{entity_type}::{name}"),
     }
 }
@@ -49,7 +49,12 @@ mod tests {
 
     #[test]
     fn test_build_entity_id_with_parent() {
-        let id = build_entity_id("src/main.ts", "method", "greet", Some("MyClass"));
-        assert_eq!(id, "src/main.ts::MyClass::greet");
+        let id = build_entity_id(
+            "src/main.ts",
+            "method",
+            "greet",
+            Some("src/main.ts::class::MyClass"),
+        );
+        assert_eq!(id, "src/main.ts::class::MyClass::greet");
     }
 }

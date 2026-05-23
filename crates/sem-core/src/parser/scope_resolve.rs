@@ -2378,6 +2378,25 @@ fn collect_all_file_refs(
             continue;
         }
 
+        // Macro invocations (Rust: macro_invocation, macro name in "macro" field)
+        if kind == "macro_invocation" {
+            if let Some(macro_node) = node.child_by_field_name("macro") {
+                let macro_name = macro_node.utf8_text(source).unwrap_or("");
+                if !macro_name.is_empty() && !is_builtin(macro_name, config) {
+                    refs.push(AstRef {
+                        kind: AstRefKind::Call(macro_name.to_string()),
+                        row: node_row,
+                    });
+                }
+            }
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.named_children(&mut cursor).collect();
+            for child in children.into_iter().rev() {
+                worklist.push(child);
+            }
+            continue;
+        }
+
         // New expression nodes (e.g. "new_expression", "object_creation_expression")
         if config.new_expr_nodes.contains(&kind) {
             if let Some(type_node) = node.child_by_field_name(config.new_expr_type_field) {

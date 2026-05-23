@@ -418,6 +418,22 @@ fn find_call_arg_count(
     None
 }
 
+/// Names too common/ambiguous for reliable arity checking (constructors, builtins).
+const AMBIGUOUS_NAMES: &[&str] = &[
+    "new", "constructor", "toString", "valueOf", "init", "__init__",
+    "apply", "call", "bind", "get", "set", "run", "execute", "create",
+];
+
+/// Path components that indicate test/fixture files (not production source).
+const TEST_PATH_MARKERS: &[&str] = &[
+    "test", "tests", "spec", "specs", "fixtures", "fixture",
+    "benchmarks", "benchmark", "__tests__", "__mocks__",
+];
+
+fn is_test_or_fixture_path(path: &str) -> bool {
+    path.split('/').any(|component| TEST_PATH_MARKERS.contains(&component))
+}
+
 /// Find arity mismatches across all Calls edges in the graph.
 pub fn find_arity_mismatches(
     graph: &EntityGraph,
@@ -427,6 +443,14 @@ pub fn find_arity_mismatches(
         .iter()
         .map(|e| (e.id.as_str(), e))
         .collect();
+
+    // Build name → count map to detect ambiguous names
+    let mut name_counts: HashMap<&str, usize> = HashMap::new();
+    for e in all_entities {
+        if matches!(e.entity_type.as_str(), "function" | "method" | "arrow_function") {
+            *name_counts.entry(&e.name).or_insert(0) += 1;
+        }
+    }
 
     // Cache param info per callee entity
     let mut param_cache: HashMap<String, Option<ParamInfo>> = HashMap::new();
@@ -450,6 +474,21 @@ pub fn find_arity_mismatches(
             continue;
         }
 
+        // Skip ambiguous/common names where name-only matching is unreliable
+        if AMBIGUOUS_NAMES.contains(&callee_info.name.as_str()) {
+            continue;
+        }
+
+        // Skip callee names shared by multiple entities (overloads, trait impls)
+        if name_counts.get(callee_info.name.as_str()).copied().unwrap_or(0) > 1 {
+            continue;
+        }
+
+        // Skip test/fixture files
+        if is_test_or_fixture_path(&callee_info.file_path) {
+            continue;
+        }
+
         let callee = match entity_by_id.get(edge.to_entity.as_str()) {
             Some(e) => *e,
             None => continue,
@@ -459,6 +498,11 @@ pub fn find_arity_mismatches(
             Some(e) => *e,
             None => continue,
         };
+
+        // Skip callers in test/fixture files
+        if is_test_or_fixture_path(&caller.file_path) {
+            continue;
+        }
 
         // Get callee param info (cached)
         let param_info = param_cache

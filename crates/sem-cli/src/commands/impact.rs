@@ -68,13 +68,29 @@ fn find_entity<'a>(
     }
 
     if let Some(file) = file_hint {
-        if let Some(e) = matching.iter().find(|e| e.file_path == file) {
-            return e;
+        let filtered: Vec<_> = matching.iter().filter(|e| e.file_path == file).copied().collect();
+        if filtered.len() == 1 {
+            return filtered[0];
         }
+        if filtered.is_empty() {
+            eprintln!("{} Entity '{}' not found in file '{}'", "error:".red().bold(), name, file);
+            std::process::exit(1);
+        }
+        // Multiple matches even within the file — fall through to ambiguity error
+        matching = filtered;
     }
 
+    if matching.len() == 1 {
+        return matching[0];
+    }
+
+    // Multiple matches — report ambiguity
     matching.sort_by_key(|e| (&e.file_path, e.start_line));
-    matching[0]
+    eprintln!("{} Entity name '{}' is ambiguous ({} matches). Specify --file or --entity-id:", "error:".red().bold(), name, matching.len());
+    for m in &matching {
+        eprintln!("  {} ({}:L{})", m.id, m.file_path, m.start_line);
+    }
+    std::process::exit(1);
 }
 
 fn entity_json(e: &sem_core::parser::graph::EntityInfo) -> serde_json::Value {
