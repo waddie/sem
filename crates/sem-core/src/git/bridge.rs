@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock};
 use git2::{Blame, Delta, Diff, DiffFindOptions, DiffOptions, ErrorCode, Oid, Repository};
 use thiserror::Error;
 
-use super::types::{CommitInfo, DiffScope, FileChange, FileStatus};
+use super::types::{CommitInfo, DiffScope, FileChange, FileCommitInfo, FileStatus};
 
 #[derive(Error, Debug)]
 pub enum GitError {
@@ -472,6 +472,111 @@ impl GitBridge {
         }
 
         Ok(commits)
+    }
+
+    /// Get commits that modified a specific file, following renames across history.
+    /// Like `git log --follow`: when the tracked path disappears between commits,
+    /// compute a diff with rename detection to find the old filename and continue.
+    /// Returns commits in reverse chronological order (newest first).
+    pub fn get_file_commits_follow_renames(
+        &self,
+        file_path: &str,
+        limit: usize,
+    ) -> Result<Vec<FileCommitInfo>, GitError> {
+        let mut revwalk = self.repo.revwalk()?;
+        revwalk.push_head()?;
+        revwalk.set_sorting(git2::Sort::TIME)?;
+
+        let mut results = Vec::new();
+        let mut tracked_path = file_path.to_string();
+
+        for oid_result in revwalk {
+            let oid = oid_result?;
+            let commit = self.repo.find_commit(oid)?;
+            let tree = commit.tree()?;
+
+            let path = Path::new(&tracked_path);
+            let file_in_commit = tree.get_path(path).ok().map(|e| e.id());
+
+            let (parent_tree_opt, file_in_parent) = if commit.parent_count() > 0 {
+                let parent = commit.parent(0)?;
+                let ptree = parent.tree()?;
+                let fip = ptree.get_path(path).ok().map(|e| e.id());
+                (Some(ptree), fip)
+            } else {
+                (None, None)
+            };
+
+            let changed = match (file_in_commit, file_in_parent) {
+                (Some(cur), Some(prev)) => cur != prev,
+                (Some(_), None) => true,
+                (None, Some(_)) => true,
+                (None, None) => false,
+            };
+
+            if changed {
+                let sha_str = oid.to_string();
+                results.push(FileCommitInfo {
+                    commit: CommitInfo {
+                        short_sha: sha_str[..7.min(sha_str.len())].to_string(),
+                        sha: sha_str,
+                        author: commit.author().name().unwrap_or("unknown").to_string(),
+                        date: commit.time().seconds().to_string(),
+                        message: commit.message().unwrap_or("").to_string(),
+                    },
+                    file_path: tracked_path.clone(),
+                });
+
+                if results.len() >= limit {
+                    break;
+                }
+            }
+
+            // If the file is not in this commit's tree, check if it was renamed.
+            // Compute diff between parent and this commit with rename detection.
+            if file_in_commit.is_none() && parent_tree_opt.is_some() {
+                let mut diff = self.repo.diff_tree_to_tree(
+                    parent_tree_opt.as_ref(),
+                    Some(&tree),
+                    None,
+                )?;
+                let mut find_opts = DiffFindOptions::new();
+                find_opts.renames(true);
+                diff.find_similar(Some(&mut find_opts))?;
+
+                let mut found_rename = false;
+                for delta in diff.deltas() {
+                    if delta.status() == Delta::Renamed {
+                        let new_path = delta
+                            .new_file()
+                            .path()
+                            .and_then(|p| p.to_str())
+                            .unwrap_or("");
+                        if new_path == tracked_path {
+                            // The tracked file was renamed FROM old_path
+                            let old_path = delta
+                                .old_file()
+                                .path()
+                                .and_then(|p| p.to_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if !old_path.is_empty() {
+                                tracked_path = old_path;
+                                found_rename = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if !found_rename {
+                    // File truly deleted, stop tracking
+                    break;
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     /// Get all file paths changed in a single commit (vs its parent).

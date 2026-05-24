@@ -604,6 +604,57 @@ fn build_scopes_from_ast(
             }
         }
 
+        // Rust mod_item: create a module scope so nested functions resolve
+        // names from the parent scope (e.g. super::target() walks up correctly).
+        if kind == "mod_item" {
+            let mod_name = node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("");
+            let mod_scope_idx = scopes.len();
+            scopes.push(Scope {
+                parent: Some(current_scope),
+                defs: HashMap::new(),
+                types: HashMap::new(),
+                pending_call_types: HashMap::new(),
+                owner_id: None,
+                kind: "module",
+            });
+
+            // Register any entities that are children of this module
+            let mod_entity = file_entities.iter().find(|e| {
+                e.name == mod_name
+                    && e.entity_type == "module"
+                    && {
+                        let line = node.start_position().row + 1;
+                        e.start_line <= line && line <= e.end_line
+                    }
+            }).copied();
+
+            if let Some(me) = mod_entity {
+                scopes[mod_scope_idx].owner_id = Some(me.id.clone());
+                entity_scope_map.entry(me.id.clone()).or_insert(current_scope);
+                entity_inner_scope.insert(me.id.clone(), mod_scope_idx);
+
+                // Register child entities in the module scope
+                if let Some(children) = children_by_parent.get(me.id.as_str()) {
+                    for child_entity in children {
+                        scopes[mod_scope_idx]
+                            .defs
+                            .insert(child_entity.name.clone(), child_entity.id.clone());
+                        entity_scope_map.insert(child_entity.id.clone(), mod_scope_idx);
+                    }
+                }
+            }
+
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.named_children(&mut cursor).collect();
+            for child in children.into_iter().rev() {
+                worklist.push((child, mod_scope_idx));
+            }
+            continue;
+        }
+
         // Function-like scope: config-driven
         let is_function_like = config.function_scope_nodes.contains(&kind);
 
@@ -1971,6 +2022,11 @@ fn extract_imports_from_ast(
                     extract_python_import(child, file_path, source, symbol_table, entity_map, import_table, scopes);
                     true
                 }
+                "import_statement" if config.self_keywords.contains(&"self") && config.self_keywords.contains(&"cls") => {
+                    // Python: `import mod` or `import mod as m`
+                    extract_python_module_import(child, file_path, source, symbol_table, entity_map, import_table, scopes);
+                    true
+                }
                 "import_statement" if !config.self_keywords.contains(&"cls") => {
                     // TS import_statement (not Python - Python uses import_from_statement)
                     extract_ts_import(child, file_path, source, symbol_table, entity_map, import_table, scopes);
@@ -2048,6 +2104,21 @@ fn extract_ts_import(
                                 resolve_import_name(original, local, source_module, file_path, symbol_table, entity_map, import_table, scopes);
                             }
                         }
+                    }
+                } else if clause_child.kind() == "namespace_import" {
+                    // import * as m from './module'
+                    // Register all entities from source module so m.foo() resolves
+                    let mut ns_cursor = clause_child.walk();
+                    let alias = clause_child
+                        .child_by_field_name("alias")
+                        .or_else(|| {
+                            clause_child.named_children(&mut ns_cursor)
+                                .find(|c| c.kind() == "identifier")
+                        })
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .unwrap_or("");
+                    if !alias.is_empty() {
+                        register_namespace_import(alias, source_module, file_path, symbol_table, entity_map, import_table, scopes);
                     }
                 } else if clause_child.kind() == "identifier" {
                     // Default import: import Foo from './module'
@@ -2249,6 +2320,50 @@ fn resolve_import_name(
     }
 }
 
+/// Register all entities from a source module under a namespace alias.
+/// For `import * as m from './module'`, all entities from the module
+/// are registered so that `m.foo()` resolves via the method call path.
+fn register_namespace_import(
+    alias: &str,
+    source_module: &str,
+    file_path: &str,
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+    import_table: &mut HashMap<(String, String), String>,
+    scopes: &mut Vec<Scope>,
+) {
+    // Find all entities whose file matches the source_module stem
+    for (name, target_ids) in symbol_table {
+        for target_id in target_ids {
+            if let Some(info) = entity_map.get(target_id) {
+                let stem = info.file_path.rsplit('/').next().unwrap_or(&info.file_path);
+                let stem = stem
+                    .strip_suffix(".ts")
+                    .or_else(|| stem.strip_suffix(".js"))
+                    .or_else(|| stem.strip_suffix(".tsx"))
+                    .or_else(|| stem.strip_suffix(".jsx"))
+                    .or_else(|| stem.strip_suffix(".py"))
+                    .unwrap_or(stem);
+                if stem == source_module && info.parent_id.is_none() {
+                    // Register entity_name under the alias for method-call resolution
+                    import_table.insert(
+                        (file_path.to_string(), name.clone()),
+                        target_id.clone(),
+                    );
+                    if !scopes.is_empty() {
+                        scopes[0].defs.insert(name.clone(), target_id.clone());
+                    }
+                }
+            }
+        }
+    }
+    // Also register the alias itself so that type tracking for `alias.method()` works:
+    // the resolve_ref MethodCall path checks import_table for the receiver.
+    // We don't have a single entity for the module, so this is handled by the
+    // Go-style package-qualified call fallback (checking method name in import_table).
+    let _ = (alias, file_path); // used above
+}
+
 fn extract_python_import(
     node: tree_sitter::Node,
     file_path: &str,
@@ -2324,6 +2439,58 @@ fn extract_python_import(
                 }
             }
         }
+    }
+}
+
+/// Python: `import mod` or `import mod as m` — registers all entities from
+/// the module so that `m.foo()` resolves via the method-call path.
+fn extract_python_module_import(
+    node: tree_sitter::Node,
+    file_path: &str,
+    source: &[u8],
+    symbol_table: &HashMap<String, Vec<String>>,
+    entity_map: &HashMap<String, EntityInfo>,
+    import_table: &mut HashMap<(String, String), String>,
+    scopes: &mut Vec<Scope>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let (module_name, _alias) = match child.kind() {
+            "dotted_name" => {
+                let name = child.utf8_text(source).unwrap_or("");
+                (name, name)
+            }
+            "aliased_import" => {
+                let orig = child
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or("");
+                let alias = child
+                    .child_by_field_name("alias")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or(orig);
+                (orig, alias)
+            }
+            _ => continue,
+        };
+
+        if module_name.is_empty() {
+            continue;
+        }
+
+        // The module stem is the last component of the dotted name
+        let source_module = module_name.rsplit('.').next().unwrap_or(module_name);
+
+        // Register all entities from the source module
+        register_namespace_import(
+            _alias,
+            source_module,
+            file_path,
+            symbol_table,
+            entity_map,
+            import_table,
+            scopes,
+        );
     }
 }
 
@@ -2478,20 +2645,33 @@ fn extract_call_ref(
         let text = func.utf8_text(source).unwrap_or("");
         let parts: Vec<&str> = text.split("::").collect();
         if parts.len() >= 2 {
-            let type_name = parts[parts.len() - 2];
+            // Handle super:: and self:: prefixed paths by emitting a call
+            // to the final name so scope chain resolution can find it.
+            let is_path_prefix =
+                parts[0] == "super" || parts[0] == "self" || parts[0] == "crate";
             let method_name = parts[parts.len() - 1];
-            if !type_name.is_empty() && !method_name.is_empty() {
-                refs.push(AstRef {
-                    kind: AstRefKind::Call(method_name.to_string()),
-                    row,
-                });
-                if type_name.chars().next().map_or(false, |c| c.is_uppercase())
-                    && !is_builtin(type_name, config)
-                {
+            if is_path_prefix {
+                if !method_name.is_empty() && !is_builtin(method_name, config) {
                     refs.push(AstRef {
-                        kind: AstRefKind::Call(type_name.to_string()),
+                        kind: AstRefKind::Call(method_name.to_string()),
                         row,
                     });
+                }
+            } else {
+                let type_name = parts[parts.len() - 2];
+                if !type_name.is_empty() && !method_name.is_empty() {
+                    refs.push(AstRef {
+                        kind: AstRefKind::Call(method_name.to_string()),
+                        row,
+                    });
+                    if type_name.chars().next().map_or(false, |c| c.is_uppercase())
+                        && !is_builtin(type_name, config)
+                    {
+                        refs.push(AstRef {
+                            kind: AstRefKind::Call(type_name.to_string()),
+                            row,
+                        });
+                    }
                 }
             }
         }
@@ -2571,9 +2751,9 @@ fn resolve_ref(
                             .map_or(false, |e| e.file_path == file_path)
                     })
                     .or_else(|| {
-                        // For lowercase calls, only fall back to global if there's exactly one match
-                        // (avoid ambiguous resolution that bag-of-words creates)
-                        if is_constructor || target_ids.len() == 1 {
+                        // Only fall back to cross-file global for constructor calls.
+                        // Lowercase calls require explicit imports to avoid false positives.
+                        if is_constructor {
                             target_ids.first()
                         } else {
                             None

@@ -40,3 +40,11 @@ pub struct CommitInfo {
     pub date: String,
     pub message: String,
 }
+
+/// A commit together with the file path that was active at that commit.
+/// Used by `get_file_commits_follow_renames` to track files across renames.
+#[derive(Debug, Clone)]
+pub struct FileCommitInfo {
+    pub commit: CommitInfo,
+    pub file_path: String,
+}

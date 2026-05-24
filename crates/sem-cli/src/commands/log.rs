@@ -24,6 +24,7 @@ enum EntityChangeType {
     Deleted,
     Moved,
     Reappeared,
+    Renamed,
 }
 
 impl EntityChangeType {
@@ -35,6 +36,7 @@ impl EntityChangeType {
             EntityChangeType::Deleted => "deleted",
             EntityChangeType::Moved => "moved",
             EntityChangeType::Reappeared => "reappeared",
+            EntityChangeType::Renamed => "renamed",
         }
     }
 
@@ -46,6 +48,7 @@ impl EntityChangeType {
             EntityChangeType::Deleted => "deleted".red(),
             EntityChangeType::Moved => "moved".blue(),
             EntityChangeType::Reappeared => "reappeared".green(),
+            EntityChangeType::Renamed => "renamed".cyan(),
         }
     }
 }
@@ -128,194 +131,206 @@ pub fn log_command(opts: LogOptions) {
         std::process::exit(1);
     }
 
-    // Walk commits, tracking entity across file moves
-    let mut current_git_file = git_file_path.clone();
+    // Walk commits, tracking entity across file moves and renames.
+    // Uses follow-renames to automatically track file renames in git history.
+    let commits = match bridge.get_file_commits_follow_renames(&git_file_path, opts.limit) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{} Failed to get file history: {}", "error:".red().bold(), e);
+            std::process::exit(1);
+        }
+    };
+
+    if commits.is_empty() {
+        eprintln!("{} No commits found for {}", "warning:".yellow().bold(), git_file_path);
+        return;
+    }
+
     let mut entries: Vec<LogEntry> = Vec::new();
     let mut prev_entity_content: Option<String> = None;
     let mut prev_structural_hash: Option<String> = None;
     let mut entity_type = String::new();
     let mut found_at_least_once = false;
-    let mut total_commits = 0usize;
-    let mut skip_until_sha: Option<String> = None;
+    let mut tracked_entity_name = opts.entity_name.clone();
+    let total_commits = commits.len();
 
-    loop {
-        let commits = match bridge.get_file_commits(&current_git_file, opts.limit) {
-            Ok(c) => c,
-            Err(e) => {
-                if total_commits == 0 {
-                    eprintln!("{} Failed to get file history: {}", "error:".red().bold(), e);
-                    std::process::exit(1);
+    // Process commits oldest-first
+    let reversed: Vec<_> = commits.iter().rev().collect();
+
+    for fci in &reversed {
+        let commit = &fci.commit;
+        let current_git_file = &fci.file_path;
+
+        let file_content = bridge
+            .read_file_at_ref(&commit.sha, current_git_file)
+            .ok()
+            .flatten();
+
+        let found_entity = file_content.as_ref().and_then(|c| {
+            let entities = registry.extract_entities(current_git_file, c);
+            entities.into_iter().find(|e| e.name == tracked_entity_name)
+        });
+
+        let date = chrono_lite_format(commit.date.parse::<i64>().unwrap_or(0));
+        let msg_first_line = commit.message.lines().next().unwrap_or("").to_string();
+
+        match found_entity {
+            Some(ent) => {
+                if !found_at_least_once {
+                    entity_type = ent.entity_type.clone();
                 }
-                break;
-            }
-        };
 
-        if commits.is_empty() && total_commits == 0 {
-            eprintln!("{} No commits found for {}", "warning:".yellow().bold(), current_git_file);
-            return;
-        }
+                let cur_content_hash = &ent.content_hash;
+                let cur_structural_hash = ent.structural_hash.as_deref();
 
-        let reversed: Vec<_> = commits.iter().rev().collect();
+                if !found_at_least_once {
+                    found_at_least_once = true;
+                    entries.push(LogEntry {
+                        sha: commit.sha.clone(),
+                        short_sha: commit.short_sha.clone(),
+                        author: commit.author.clone(),
+                        date,
+                        message: msg_first_line,
+                        change_type: EntityChangeType::Added,
+                        content: Some(ent.content.clone()),
+                        prev_content: None,
+                        file_path: Some(current_git_file.clone()),
+                        prev_file_path: None,
+                    });
+                } else if prev_entity_content.is_none() {
+                    entries.push(LogEntry {
+                        sha: commit.sha.clone(),
+                        short_sha: commit.short_sha.clone(),
+                        author: commit.author.clone(),
+                        date,
+                        message: msg_first_line,
+                        change_type: EntityChangeType::Reappeared,
+                        content: Some(ent.content.clone()),
+                        prev_content: None,
+                        file_path: Some(current_git_file.clone()),
+                        prev_file_path: None,
+                    });
+                } else {
+                    let prev_hash = prev_entity_content
+                        .as_ref()
+                        .map(|c| sem_core::utils::hash::content_hash(c));
+                    let content_changed =
+                        prev_hash.as_deref() != Some(cur_content_hash.as_str());
 
-        // After a file move, skip commits until the move commit
-        let start_idx = if let Some(ref sha) = skip_until_sha {
-            reversed
-                .iter()
-                .position(|c| c.sha == *sha)
-                .map(|i| i + 1)
-                .unwrap_or(reversed.len())
-        } else {
-            0
-        };
-        skip_until_sha = None;
-
-        total_commits += reversed.len().saturating_sub(start_idx);
-        let mut moved = false;
-
-        for commit in &reversed[start_idx..] {
-            let file_content = bridge
-                .read_file_at_ref(&commit.sha, &current_git_file)
-                .ok()
-                .flatten();
-
-            let found_entity = file_content.as_ref().and_then(|c| {
-                let entities = registry.extract_entities(&current_git_file, c);
-                entities.into_iter().find(|e| e.name == opts.entity_name)
-            });
-
-            let date = chrono_lite_format(commit.date.parse::<i64>().unwrap_or(0));
-            let msg_first_line = commit.message.lines().next().unwrap_or("").to_string();
-
-            match found_entity {
-                Some(ent) => {
-                    if !found_at_least_once {
-                        entity_type = ent.entity_type.clone();
-                    }
-
-                    let cur_content_hash = &ent.content_hash;
-                    let cur_structural_hash = ent.structural_hash.as_deref();
-
-                    if !found_at_least_once {
-                        found_at_least_once = true;
-                        entries.push(LogEntry {
-                            sha: commit.sha.clone(),
-                            short_sha: commit.short_sha.clone(),
-                            author: commit.author.clone(),
-                            date,
-                            message: msg_first_line,
-                            change_type: EntityChangeType::Added,
-                            content: Some(ent.content.clone()),
-                            prev_content: None,
-                            file_path: Some(current_git_file.clone()),
-                            prev_file_path: None,
-                        });
-                    } else if prev_entity_content.is_none() {
-                        entries.push(LogEntry {
-                            sha: commit.sha.clone(),
-                            short_sha: commit.short_sha.clone(),
-                            author: commit.author.clone(),
-                            date,
-                            message: msg_first_line,
-                            change_type: EntityChangeType::Reappeared,
-                            content: Some(ent.content.clone()),
-                            prev_content: None,
-                            file_path: Some(current_git_file.clone()),
-                            prev_file_path: None,
-                        });
-                    } else {
-                        let prev_hash = prev_entity_content
-                            .as_ref()
-                            .map(|c| sem_core::utils::hash::content_hash(c));
-                        let content_changed =
-                            prev_hash.as_deref() != Some(cur_content_hash.as_str());
-
-                        if content_changed {
-                            let structural_changed =
-                                match (cur_structural_hash, prev_structural_hash.as_deref()) {
-                                    (Some(cur), Some(prev)) => cur != prev,
-                                    _ => true,
-                                };
-                            let change_type = if structural_changed {
-                                EntityChangeType::ModifiedLogic
-                            } else {
-                                EntityChangeType::ModifiedCosmetic
+                    if content_changed {
+                        let structural_changed =
+                            match (cur_structural_hash, prev_structural_hash.as_deref()) {
+                                (Some(cur), Some(prev)) => cur != prev,
+                                _ => true,
                             };
+                        let change_type = if structural_changed {
+                            EntityChangeType::ModifiedLogic
+                        } else {
+                            EntityChangeType::ModifiedCosmetic
+                        };
+                        entries.push(LogEntry {
+                            sha: commit.sha.clone(),
+                            short_sha: commit.short_sha.clone(),
+                            author: commit.author.clone(),
+                            date,
+                            message: msg_first_line,
+                            change_type,
+                            content: Some(ent.content.clone()),
+                            prev_content: prev_entity_content.clone(),
+                            file_path: Some(current_git_file.clone()),
+                            prev_file_path: None,
+                        });
+                    }
+                }
+
+                prev_entity_content = Some(ent.content.clone());
+                prev_structural_hash = ent.structural_hash.clone();
+            }
+            None => {
+                // Entity not found by name. Before cross-file search,
+                // try same-file structural hash fallback to detect renames.
+                if let Some(ref prev_shash) = prev_structural_hash {
+                    let renamed_entity = file_content.as_ref().and_then(|c| {
+                        let entities = registry.extract_entities(current_git_file, c);
+                        entities.into_iter().find(|e| {
+                            e.structural_hash.as_deref() == Some(prev_shash.as_str())
+                        })
+                    });
+
+                    if let Some(ent) = renamed_entity {
+                        // Entity was renamed within the same file
+                        entries.push(LogEntry {
+                            sha: commit.sha.clone(),
+                            short_sha: commit.short_sha.clone(),
+                            author: commit.author.clone(),
+                            date,
+                            message: msg_first_line,
+                            change_type: EntityChangeType::Renamed,
+                            content: Some(ent.content.clone()),
+                            prev_content: prev_entity_content.clone(),
+                            file_path: Some(current_git_file.clone()),
+                            prev_file_path: None,
+                        });
+
+                        // Update tracked name to continue backward traversal
+                        tracked_entity_name = ent.name.clone();
+                        prev_entity_content = Some(ent.content.clone());
+                        prev_structural_hash = ent.structural_hash.clone();
+                        if !found_at_least_once {
+                            entity_type = ent.entity_type.clone();
+                            found_at_least_once = true;
+                        }
+                        continue;
+                    }
+                }
+
+                // Try cross-file search
+                if prev_entity_content.is_some() {
+                    let cross = search_entity_cross_file(
+                        &bridge,
+                        &registry,
+                        &commit.sha,
+                        &tracked_entity_name,
+                        prev_structural_hash.as_deref(),
+                        current_git_file,
+                    );
+
+                    match cross {
+                        Some((new_file, ent)) => {
                             entries.push(LogEntry {
                                 sha: commit.sha.clone(),
                                 short_sha: commit.short_sha.clone(),
                                 author: commit.author.clone(),
                                 date,
                                 message: msg_first_line,
-                                change_type,
+                                change_type: EntityChangeType::Moved,
                                 content: Some(ent.content.clone()),
                                 prev_content: prev_entity_content.clone(),
+                                file_path: Some(new_file),
+                                prev_file_path: Some(current_git_file.clone()),
+                            });
+
+                            prev_entity_content = Some(ent.content.clone());
+                            prev_structural_hash = ent.structural_hash.clone();
+                        }
+                        None => {
+                            entries.push(LogEntry {
+                                sha: commit.sha.clone(),
+                                short_sha: commit.short_sha.clone(),
+                                author: commit.author.clone(),
+                                date,
+                                message: msg_first_line,
+                                change_type: EntityChangeType::Deleted,
+                                content: None,
+                                prev_content: prev_entity_content.take(),
                                 file_path: Some(current_git_file.clone()),
                                 prev_file_path: None,
                             });
-                        }
-                    }
-
-                    prev_entity_content = Some(ent.content.clone());
-                    prev_structural_hash = ent.structural_hash.clone();
-                }
-                None => {
-                    // Entity not in tracked file. Try cross-file search.
-                    if prev_entity_content.is_some() {
-                        let cross = search_entity_cross_file(
-                            &bridge,
-                            &registry,
-                            &commit.sha,
-                            &opts.entity_name,
-                            prev_structural_hash.as_deref(),
-                            &current_git_file,
-                        );
-
-                        match cross {
-                            Some((new_file, ent)) => {
-                                let prev_file = current_git_file.clone();
-                                entries.push(LogEntry {
-                                    sha: commit.sha.clone(),
-                                    short_sha: commit.short_sha.clone(),
-                                    author: commit.author.clone(),
-                                    date,
-                                    message: msg_first_line,
-                                    change_type: EntityChangeType::Moved,
-                                    content: Some(ent.content.clone()),
-                                    prev_content: prev_entity_content.clone(),
-                                    file_path: Some(new_file.clone()),
-                                    prev_file_path: Some(prev_file),
-                                });
-
-                                prev_entity_content = Some(ent.content.clone());
-                                prev_structural_hash = ent.structural_hash.clone();
-                                skip_until_sha = Some(commit.sha.clone());
-                                current_git_file = new_file;
-                                moved = true;
-                                break;
-                            }
-                            None => {
-                                entries.push(LogEntry {
-                                    sha: commit.sha.clone(),
-                                    short_sha: commit.short_sha.clone(),
-                                    author: commit.author.clone(),
-                                    date,
-                                    message: msg_first_line,
-                                    change_type: EntityChangeType::Deleted,
-                                    content: None,
-                                    prev_content: prev_entity_content.take(),
-                                    file_path: Some(current_git_file.clone()),
-                                    prev_file_path: None,
-                                });
-                                prev_structural_hash = None;
-                            }
+                            prev_structural_hash = None;
                         }
                     }
                 }
             }
-        }
-
-        if !moved {
-            break;
         }
     }
 
@@ -405,6 +420,14 @@ fn print_terminal(
                     format!("→ moved to {}", new_fp).blue()
                 );
             }
+        }
+
+        // Show rename info
+        if matches!(entry.change_type, EntityChangeType::Renamed) {
+            println!(
+                "│    {}",
+                "→ entity renamed (structural hash match)".cyan()
+            );
         }
 
         if verbose {

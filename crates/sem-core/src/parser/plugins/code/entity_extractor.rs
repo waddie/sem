@@ -1,6 +1,7 @@
 use tree_sitter::{Node, Tree};
 
-use crate::model::entity::{build_entity_id, SemanticEntity};
+use std::collections::HashMap;
+use crate::model::entity::{build_entity_id, build_entity_id_disambiguated, SemanticEntity};
 use crate::utils::hash::{content_hash, structural_hash, structural_hash_excluding_range};
 use super::languages::LanguageConfig;
 
@@ -20,6 +21,30 @@ pub fn extract_entities(
         source_code.as_bytes(),
         None,
     );
+
+    // Post-pass: disambiguate colliding entity IDs by appending @L{line}.
+    // Two overloads with the same name (e.g. function overloads in C++/TS)
+    // get identical IDs; re-assign all colliding entries with line suffixes.
+    let mut id_indices: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, entity) in entities.iter().enumerate() {
+        id_indices.entry(entity.id.clone()).or_default().push(i);
+    }
+    for (_id, indices) in &id_indices {
+        if indices.len() > 1 {
+            for &idx in indices {
+                let e = &entities[idx];
+                let new_id = build_entity_id_disambiguated(
+                    &e.file_path,
+                    &e.entity_type,
+                    &e.name,
+                    e.parent_id.as_deref(),
+                    e.start_line,
+                );
+                entities[idx].id = new_id;
+            }
+        }
+    }
+
     entities
 }
 
@@ -156,7 +181,8 @@ fn visit_node(
                 .filter(|c| c.kind() == "variable_declarator")
                 .collect();
             if declarators.len() > 1 {
-                let should_skip = should_skip_entity(config, suppression_context, node_type);
+                let should_skip = should_skip_entity(config, suppression_context, node_type)
+                    && promote_js_ts_const_function(node, config).is_none();
                 if !should_skip {
                     for declarator in &declarators {
                         if let Some(name_node) = declarator.child_by_field_name("name") {
@@ -240,11 +266,53 @@ fn visit_node(
             }
         }
 
+        // JS/TS test call expressions: describe("name", () => {}), test(...), it(...), etc.
+        if node_type == "call_expression" && matches!(config.id, "typescript" | "tsx" | "javascript") {
+            if let Some((test_name, test_entity_type, is_container)) =
+                extract_js_test_call(node, source)
+            {
+                let content_str = node_text(node, source);
+                let content = content_str.to_string();
+                let struct_hash = compute_structural_hash(node, source);
+                let entity = SemanticEntity {
+                    id: build_entity_id(file_path, test_entity_type, &test_name, parent_id),
+                    file_path: file_path.to_string(),
+                    entity_type: test_entity_type.to_string(),
+                    name: test_name.clone(),
+                    parent_id: parent_id.map(String::from),
+                    content_hash: content_hash(&content),
+                    structural_hash: Some(struct_hash),
+                    content,
+                    start_line: node.start_position().row + 1,
+                    end_line: node.end_position().row + 1,
+                    metadata: None,
+                };
+
+                let entity_id = entity.id.clone();
+                entities.push(entity);
+
+                if is_container {
+                    // Recurse into the callback body to extract nested test entities
+                    if let Some(callback) = find_test_callback(node) {
+                        if let Some(body) = callback.child_by_field_name("body") {
+                            let mut cursor = body.walk();
+                            let nested: Vec<_> = body.named_children(&mut cursor).collect();
+                            for n in nested.into_iter().rev() {
+                                worklist.push((n, Some(entity_id.clone()), sup_owned.clone()));
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
         if config.entity_node_types.contains(&node_type) {
             if let Some(name) = extract_name(node, source) {
                 let name = qualify_hcl_name(&name, node_type, parent_id, suppression_context);
                 let entity_type = map_entity_type(node, config);
-                let should_skip = should_skip_entity(config, suppression_context, node_type);
+                let should_skip = should_skip_entity(config, suppression_context, node_type)
+                    && promote_js_ts_const_function(node, config).is_none();
                 if !should_skip {
                     // Go method_declaration: extract receiver type for parent linkage.
                     // e.g. `func (t *Transaction) Execute(...)` -> parent is Transaction struct
@@ -1627,4 +1695,80 @@ fn extract_go_receiver_struct(
         }
     }
     None
+}
+
+/// Check if a JS/TS call_expression is a test framework call (describe, test, it, etc.).
+/// Returns (name, entity_type, is_container) if matched.
+fn extract_js_test_call(node: Node, source: &[u8]) -> Option<(String, &'static str, bool)> {
+    let func = node.child_by_field_name("function")?;
+    let (callee_name, _modifier) = match func.kind() {
+        "identifier" => {
+            let name = node_text(func, source);
+            (name, None)
+        }
+        "member_expression" => {
+            // describe.skip, test.only, it.each, etc.
+            let obj = func.child_by_field_name("object")?;
+            let prop = func.child_by_field_name("property")?;
+            if obj.kind() != "identifier" {
+                return None;
+            }
+            (node_text(obj, source), Some(node_text(prop, source)))
+        }
+        _ => return None,
+    };
+
+    let (entity_type, is_container) = match callee_name {
+        "describe" => ("test_suite", true),
+        "test" | "it" => ("test", false),
+        "beforeEach" | "afterEach" | "beforeAll" | "afterAll" => ("test_hook", false),
+        _ => return None,
+    };
+
+    // Extract the test name from the first string argument
+    let mut cursor = node.walk();
+    let args = node
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "arguments")?;
+
+    let mut args_cursor = args.walk();
+    let first_arg = args.named_children(&mut args_cursor).next()?;
+
+    let test_name = match first_arg.kind() {
+        "string" | "template_string" => {
+            let text = node_text(first_arg, source);
+            text.trim_matches(|c: char| c == '\'' || c == '"' || c == '`')
+                .to_string()
+        }
+        _ => {
+            // Hooks like beforeEach don't need a string name
+            if matches!(callee_name, "beforeEach" | "afterEach" | "beforeAll" | "afterAll") {
+                callee_name.to_string()
+            } else {
+                return None;
+            }
+        }
+    };
+
+    Some((test_name, entity_type, is_container))
+}
+
+/// Find the callback function argument in a test call (the second argument).
+fn find_test_callback(node: Node) -> Option<Node> {
+    let mut cursor = node.walk();
+    let args = node
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "arguments")?;
+    let mut args_cursor = args.walk();
+    let mut children = args.named_children(&mut args_cursor);
+    children.next(); // skip the first argument (name string)
+    let callback = children.next()?;
+    if matches!(
+        callback.kind(),
+        "arrow_function" | "function_expression" | "generator_function"
+    ) {
+        Some(callback)
+    } else {
+        None
+    }
 }

@@ -35,6 +35,18 @@ pub fn build_entity_id(
     }
 }
 
+/// Build an entity ID with a line-number disambiguator for overloads.
+pub fn build_entity_id_disambiguated(
+    file_path: &str,
+    entity_type: &str,
+    name: &str,
+    parent_id: Option<&str>,
+    line: usize,
+) -> String {
+    let base = build_entity_id(file_path, entity_type, name, parent_id);
+    format!("{base}@L{line}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
