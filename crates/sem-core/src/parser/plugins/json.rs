@@ -1,4 +1,4 @@
-use crate::model::entity::SemanticEntity;
+use crate::model::entity::{build_entity_id, SemanticEntity};
 use crate::parser::plugin::SemanticParserPlugin;
 use crate::utils::hash::content_hash;
 
@@ -14,11 +14,24 @@ impl SemanticParserPlugin for JsonParserPlugin {
     }
 
     fn extract_entities(&self, content: &str, file_path: &str) -> Vec<SemanticEntity> {
-        if !content.trim().starts_with('{') {
+        let trimmed = content.trim_start();
+        if trimmed.starts_with('{') {
+            return extract_entries(content, file_path, JsonContainerKind::Object);
+        }
+        if trimmed.starts_with('[') {
+            return extract_entries(content, file_path, JsonContainerKind::Array);
+        }
+        if trimmed.is_empty() {
             return Vec::new();
         }
-        extract_entries(content, file_path)
+        vec![document_chunk_entity(content, file_path)]
     }
+}
+
+#[derive(Clone, Copy)]
+enum JsonContainerKind {
+    Object,
+    Array,
 }
 
 struct Frame {
@@ -28,15 +41,23 @@ struct Frame {
     line_offset: usize,
     parent_pointer: Option<String>,
     parent_entity_id: Option<String>,
+    container_kind: JsonContainerKind,
 }
 
 /// Iterative walk of the JSON tree, emitting entities in DFS pre-order.
 /// Frames track a cursor through their entries; encountering an
 /// object-valued entry pushes both the parent frame (resumed after) and the
 /// child frame (visited next), so children appear before later siblings.
-fn extract_entries(content: &str, file_path: &str) -> Vec<SemanticEntity> {
+fn extract_entries(
+    content: &str,
+    file_path: &str,
+    container_kind: JsonContainerKind,
+) -> Vec<SemanticEntity> {
     let mut entities = Vec::new();
-    let root_entries = find_top_level_entries(content);
+    let root_entries = match container_kind {
+        JsonContainerKind::Object => find_top_level_entries(content),
+        JsonContainerKind::Array => find_top_level_array_entries(content),
+    };
     let mut worklist: Vec<Frame> = vec![Frame {
         content: content.to_string(),
         entries: root_entries,
@@ -44,20 +65,49 @@ fn extract_entries(content: &str, file_path: &str) -> Vec<SemanticEntity> {
         line_offset: 1,
         parent_pointer: None,
         parent_entity_id: None,
+        container_kind,
     }];
 
     while let Some(mut frame) = worklist.pop() {
         let lines: Vec<&str> = frame.content.lines().collect();
-        let closing = find_closing_brace_line(&lines);
+        let closing = find_closing_container_line(&lines, frame.container_kind);
 
         while frame.cursor < frame.entries.len() {
             let i = frame.cursor;
             frame.cursor += 1;
             let entry = &frame.entries[i];
-            let next_boundary = frame.entries.get(i + 1).map(|e| e.start_line).unwrap_or(closing);
-            let end_line = trim_trailing_blanks(&lines, entry.start_line, next_boundary);
-
-            let entity_content = lines[entry.start_line - 1..end_line].join("\n");
+            let (end_line, entity_content) =
+                if let (Some(start_byte), Some(end_byte), Some(end_line)) = (
+                    entry.content_start_byte,
+                    entry.content_end_byte_exclusive,
+                    entry.end_line,
+                )
+                {
+                    let Some(entity_content) = frame
+                        .content
+                        .get(start_byte..end_byte)
+                        .map(|content| content.to_string())
+                    else {
+                        debug_assert!(
+                            false,
+                            "array entry byte range must be valid within frame content"
+                        );
+                        continue;
+                    };
+                    (
+                        end_line,
+                        entity_content,
+                    )
+                } else {
+                    let next_boundary = frame
+                        .entries
+                        .get(i + 1)
+                        .map(|e| e.start_line)
+                        .unwrap_or(closing);
+                    let end_line = trim_trailing_blanks(&lines, entry.start_line, next_boundary);
+                    let entity_content = lines[entry.start_line - 1..end_line].join("\n");
+                    (end_line, entity_content)
+                };
             let value_content = extract_value_content(&entity_content);
 
             let pointer = match &frame.parent_pointer {
@@ -82,7 +132,7 @@ fn extract_entries(content: &str, file_path: &str) -> Vec<SemanticEntity> {
                 metadata: None,
             });
 
-            if entry.entity_type == "object" {
+            if entry.entity_type == "object" && entry.descend_into_object {
                 if let Some(obj_str) = extract_object_value(&entity_content) {
                     let obj_line_in_entity = find_value_start_line(&entity_content);
                     let child = Frame {
@@ -92,6 +142,7 @@ fn extract_entries(content: &str, file_path: &str) -> Vec<SemanticEntity> {
                         line_offset: abs_start + obj_line_in_entity - 1,
                         parent_pointer: Some(pointer),
                         parent_entity_id: Some(entity_id),
+                        container_kind: JsonContainerKind::Object,
                     };
                     worklist.push(frame);
                     worklist.push(child);
@@ -102,6 +153,23 @@ fn extract_entries(content: &str, file_path: &str) -> Vec<SemanticEntity> {
     }
 
     entities
+}
+
+fn document_chunk_entity(content: &str, file_path: &str) -> SemanticEntity {
+    let line_count = content.lines().count().max(1);
+    SemanticEntity {
+        id: build_entity_id(file_path, "chunk", "(document)", None),
+        file_path: file_path.to_string(),
+        entity_type: "chunk".to_string(),
+        name: "(document)".to_string(),
+        parent_id: None,
+        content_hash: content_hash(content),
+        structural_hash: None,
+        content: content.to_string(),
+        start_line: 1,
+        end_line: line_count,
+        metadata: None,
+    }
 }
 
 /// Given an entity content string like `  "scripts": {\n    "build": "tsc"\n  }`,
@@ -215,6 +283,11 @@ struct JsonEntry {
     pointer: String,
     entity_type: String,
     start_line: usize, // 1-based, relative to the content passed in
+    end_line: Option<usize>,
+    // Byte offsets are relative to the current frame content; end is exclusive.
+    content_start_byte: Option<usize>,
+    content_end_byte_exclusive: Option<usize>,
+    descend_into_object: bool,
 }
 
 /// Scan the source text to find each top-level key in the root JSON object.
@@ -285,6 +358,10 @@ fn find_top_level_entries(content: &str) -> Vec<JsonEntry> {
                             pointer,
                             entity_type: String::new(),
                             start_line: line_num,
+                            end_line: None,
+                            content_start_byte: None,
+                            content_end_byte_exclusive: None,
+                            descend_into_object: false,
                         });
                         key_start = true;
                     }
@@ -295,6 +372,7 @@ fn find_top_level_entries(content: &str) -> Vec<JsonEntry> {
                 if depth == 2 && key_start {
                     if let Some(entry) = entries.last_mut() {
                         entry.entity_type = if ch == '{' { "object" } else { "array" }.to_string();
+                        entry.descend_into_object = ch == '{';
                     }
                 }
             }
@@ -325,6 +403,138 @@ fn find_top_level_entries(content: &str) -> Vec<JsonEntry> {
     entries
 }
 
+/// Scan a root JSON array and emit each top-level index as an opaque entity.
+/// Nested object fields are intentionally not extracted here because array
+/// elements usually do not have stable identity beyond their current index.
+fn find_top_level_array_entries(content: &str) -> Vec<JsonEntry> {
+    let mut entries = Vec::new();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut line_num: usize = 1;
+    let mut expecting_item = false;
+    let mut current: Option<JsonEntry> = None;
+
+    for (i, ch) in content.char_indices() {
+        if ch == '\n' {
+            line_num += 1;
+        }
+
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escape_next = true;
+            continue;
+        }
+        if in_string {
+            if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if depth == 1 && expecting_item && !ch.is_whitespace() && ch != ']' && ch != ',' {
+            let index = entries.len();
+            current = Some(JsonEntry {
+                key: index.to_string(),
+                pointer: format!("/{index}"),
+                entity_type: match ch {
+                    '{' => "object",
+                    '[' => "array",
+                    _ => "array_item",
+                }
+                .to_string(),
+                start_line: line_num,
+                end_line: None,
+                content_start_byte: Some(i),
+                content_end_byte_exclusive: None,
+                descend_into_object: false,
+            });
+            expecting_item = false;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+            }
+            '[' => {
+                depth += 1;
+                if depth == 1 {
+                    expecting_item = true;
+                }
+            }
+            '{' => {
+                depth += 1;
+            }
+            ']' => {
+                if depth == 1 {
+                    finish_array_entry(&mut entries, &mut current, content, i);
+                    expecting_item = false;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+            }
+            ',' => {
+                if depth == 1 {
+                    finish_array_entry(&mut entries, &mut current, content, i);
+                    expecting_item = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    finish_array_entry(&mut entries, &mut current, content, content.len());
+
+    entries
+}
+
+fn finish_array_entry(
+    entries: &mut Vec<JsonEntry>,
+    current: &mut Option<JsonEntry>,
+    content: &str,
+    delimiter_byte: usize,
+) {
+    if let Some(mut entry) = current.take() {
+        let Some(start_byte) = entry.content_start_byte else {
+            return;
+        };
+        let end_byte = content
+            .get(..delimiter_byte)
+            .map(|prefix| prefix.trim_end().len())
+            .unwrap_or(delimiter_byte);
+        if start_byte >= end_byte {
+            debug_assert!(
+                start_byte < end_byte,
+                "array entry start byte must precede content end byte"
+            );
+            return;
+        }
+
+        entry.content_end_byte_exclusive = Some(end_byte);
+        entry.end_line = entry_end_line(content, &entry);
+        entries.push(entry);
+    }
+}
+
+fn entry_end_line(content: &str, entry: &JsonEntry) -> Option<usize> {
+    let start = entry.content_start_byte?;
+    let end = entry.content_end_byte_exclusive?;
+    Some(
+        entry.start_line
+            + content
+                .get(start..end)?
+                .trim_end()
+                .chars()
+                .filter(|ch| *ch == '\n')
+                .count(),
+    )
+}
+
 /// Extract just the value portion of a `"key": value` entity content string,
 /// stripping the key name so that renamed keys with identical values share the
 /// same structural_hash and are detected as renames rather than delete + add.
@@ -351,10 +561,14 @@ fn extract_value_content(content: &str) -> &str {
     content
 }
 
-/// Find the line number (1-based) of the closing `}` of the root object.
-fn find_closing_brace_line(lines: &[&str]) -> usize {
+/// Find the line number (1-based) of the root closing delimiter.
+fn find_closing_container_line(lines: &[&str], container_kind: JsonContainerKind) -> usize {
+    let closing = match container_kind {
+        JsonContainerKind::Object => "}",
+        JsonContainerKind::Array => "]",
+    };
     for (i, line) in lines.iter().enumerate().rev() {
-        if line.trim() == "}" {
+        if line.trim() == closing {
             return i + 1;
         }
     }
@@ -756,6 +970,139 @@ mod tests {
             "array elements have no stable identity; only the array key should change");
     }
 
+    #[test]
+    fn root_array_items_are_top_level_entities() {
+        let content = r#"[
+  {"id": 1, "name": "alpha"},
+  "beta",
+  [1, 2]
+]
+"#;
+        let plugin = JsonParserPlugin;
+        let entities = plugin.extract_entities(content, "arr.json");
+
+        assert_eq!(entities.len(), 3);
+
+        assert_eq!(entities[0].id, "arr.json::/0");
+        assert_eq!(entities[0].name, "0");
+        assert_eq!(entities[0].entity_type, "object");
+        assert_eq!(entities[0].parent_id, None);
+        assert_eq!(entities[0].start_line, 2);
+        assert_eq!(entities[0].end_line, 2);
+
+        assert_eq!(entities[1].id, "arr.json::/1");
+        assert_eq!(entities[1].name, "1");
+        assert_eq!(entities[1].entity_type, "array_item");
+        assert_eq!(entities[1].start_line, 3);
+
+        assert_eq!(entities[2].id, "arr.json::/2");
+        assert_eq!(entities[2].name, "2");
+        assert_eq!(entities[2].entity_type, "array");
+        assert_eq!(entities[2].start_line, 4);
+    }
+
+    #[test]
+    fn compact_root_array_items_keep_separate_content() {
+        let plugin = JsonParserPlugin;
+        let entities = plugin.extract_entities(r#"[{"id":1},{"id":2}]"#, "arr.json");
+
+        assert_eq!(entities.len(), 2);
+        assert_eq!(entities[0].id, "arr.json::/0");
+        assert_eq!(entities[0].content, r#"{"id":1}"#);
+        assert_eq!(entities[0].start_line, 1);
+        assert_eq!(entities[0].end_line, 1);
+        assert_eq!(entities[1].id, "arr.json::/1");
+        assert_eq!(entities[1].content, r#"{"id":2}"#);
+        assert_eq!(entities[1].start_line, 1);
+        assert_eq!(entities[1].end_line, 1);
+    }
+
+    #[test]
+    fn root_array_nested_containers_keep_whole_item_content() {
+        let plugin = JsonParserPlugin;
+        let entities = plugin.extract_entities(
+            r#"[{"id":1,"meta":{"a":true},"list":[{"b":2},3]},[{"nested":4}]]"#,
+            "arr.json",
+        );
+
+        assert_eq!(entities.len(), 2);
+        assert_eq!(entities[0].id, "arr.json::/0");
+        assert_eq!(entities[0].entity_type, "object");
+        assert_eq!(
+            entities[0].content,
+            r#"{"id":1,"meta":{"a":true},"list":[{"b":2},3]}"#
+        );
+        assert_eq!(entities[1].id, "arr.json::/1");
+        assert_eq!(entities[1].entity_type, "array");
+        assert_eq!(entities[1].content, r#"[{"nested":4}]"#);
+    }
+
+    #[test]
+    fn compact_root_array_scalars_keep_exact_value_content() {
+        let plugin = JsonParserPlugin;
+        let entities = plugin.extract_entities(r#"[1,"two",[3,4]]"#, "arr.json");
+
+        assert_eq!(entities.len(), 3);
+
+        assert_eq!(entities[0].id, "arr.json::/0");
+        assert_eq!(entities[0].content, "1");
+        assert_eq!(entities[0].entity_type, "array_item");
+
+        assert_eq!(entities[1].id, "arr.json::/1");
+        assert_eq!(entities[1].content, r#""two""#);
+        assert_eq!(entities[1].entity_type, "array_item");
+
+        assert_eq!(entities[2].id, "arr.json::/2");
+        assert_eq!(entities[2].content, "[3,4]");
+        assert_eq!(entities[2].entity_type, "array");
+    }
+
+    #[test]
+    fn root_array_items_trim_delimiter_whitespace_from_content() {
+        let plugin = JsonParserPlugin;
+        let content = "[1 ,\n  {\"id\": 2}\n]\n";
+        let entities = plugin.extract_entities(content, "arr.json");
+
+        assert_eq!(entities.len(), 2);
+        assert_eq!(entities[0].content, "1");
+        assert_eq!(entities[0].start_line, 1);
+        assert_eq!(entities[0].end_line, 1);
+        assert_eq!(entities[1].content, "{\"id\": 2}");
+        assert_eq!(entities[1].start_line, 2);
+        assert_eq!(entities[1].end_line, 2);
+    }
+
+    #[test]
+    fn root_array_item_at_eof_is_preserved_for_truncated_json() {
+        let plugin = JsonParserPlugin;
+        let entities = plugin.extract_entities("[1", "arr.json");
+
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].id, "arr.json::/0");
+        assert_eq!(entities[0].content, "1");
+        assert_eq!(entities[0].entity_type, "array_item");
+    }
+
+    #[test]
+    fn root_array_item_modified_reports_the_index() {
+        let changes = json_diff(
+            "[\n  {\"id\": 1, \"name\": \"alpha\"}\n]",
+            "[\n  {\"id\": 1, \"name\": \"beta\"}\n]",
+        );
+
+        assert_eq!(names(&changes), vec![("0".into(), ChangeType::Modified)]);
+        assert_eq!(changes[0].entity_id, "test.json::/0");
+        assert_eq!(changes[0].entity_type, "object");
+    }
+
+    #[test]
+    fn root_array_item_added_from_empty_array() {
+        let changes = json_diff("[]", "[\n  {\"id\": 1}\n]");
+
+        assert_eq!(names(&changes), vec![("0".into(), ChangeType::Added)]);
+        assert_eq!(changes[0].entity_id, "test.json::/0");
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     //  Null and empty values
     // ─────────────────────────────────────────────────────────────────────────
@@ -940,14 +1287,36 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn documents_without_extractable_keys_produce_no_entities() {
+    fn empty_object_and_array_produce_no_entities() {
         let plugin = JsonParserPlugin;
-        for input in ["[1, 2, 3]", "\"hello\"", "42", "null", "{}"] {
+        for input in ["{}", "[]"] {
             assert!(
                 plugin.extract_entities(input, "test.json").is_empty(),
                 "input: {input}"
             );
         }
+    }
+
+    #[test]
+    fn root_scalars_produce_document_chunk() {
+        let plugin = JsonParserPlugin;
+        for input in ["\"hello\"", "42", "null"] {
+            let entities = plugin.extract_entities(input, "test.json");
+            assert_eq!(entities.len(), 1, "input: {input}");
+            assert_eq!(entities[0].id, "test.json::chunk::(document)");
+            assert_eq!(entities[0].entity_type, "chunk");
+            assert_eq!(entities[0].name, "(document)");
+            assert_eq!(entities[0].start_line, 1);
+            assert_eq!(entities[0].end_line, 1);
+        }
+    }
+
+    #[test]
+    fn root_scalar_change_reports_document_modified() {
+        let changes = json_diff("42", "43");
+
+        assert_eq!(names(&changes), vec![("(document)".into(), ChangeType::Modified)]);
+        assert_eq!(changes[0].entity_type, "chunk");
     }
 
     #[test]
