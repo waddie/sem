@@ -20,7 +20,7 @@ pub enum FileStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileChange {
     pub file_path: String,
     pub status: FileStatus,
@@ -47,4 +47,31 @@ pub struct CommitInfo {
 pub struct FileCommitInfo {
     pub commit: CommitInfo,
     pub file_path: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FileChange, FileStatus};
+
+    #[test]
+    fn file_change_rejects_unknown_fields() {
+        let err = serde_json::from_str::<FileChange>(
+            r#"{"filePath":"b.ts","oldPath":"a.ts","status":"renamed"}"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown field `oldPath`"));
+    }
+
+    #[test]
+    fn file_change_accepts_known_camel_case_fields() {
+        let change = serde_json::from_str::<FileChange>(
+            r#"{"filePath":"b.ts","oldFilePath":"a.ts","status":"renamed"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(change.file_path, "b.ts");
+        assert_eq!(change.old_file_path.as_deref(), Some("a.ts"));
+        assert_eq!(change.status, FileStatus::Renamed);
+    }
 }
