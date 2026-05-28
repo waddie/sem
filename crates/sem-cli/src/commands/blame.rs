@@ -38,6 +38,11 @@ pub fn blame_command(opts: BlameOptions) {
 
     let entities = registry.extract_entities(&opts.file_path, &content);
     if entities.is_empty() {
+        if opts.json {
+            println!("[]");
+            return;
+        }
+
         eprintln!("{} No entities found in {}", "warning:".yellow().bold(), opts.file_path);
         return;
     }
