@@ -467,8 +467,9 @@ mod tests {
         assert_eq!(result.changes.len(), 1);
         assert_eq!(result.file_count, 1);
         assert_eq!(result.orphan_count, 1);
-        assert_eq!(result.modified_count, 0);
+        assert_eq!(result.modified_count, 1);
         assert_eq!(result.changes[0].entity_type, "orphan");
+        assert_eq!(result.changes[0].change_type, ChangeType::Modified);
     }
 
     #[test]
