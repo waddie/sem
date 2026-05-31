@@ -4,6 +4,7 @@ pub mod csv_plugin;
 pub mod erb;
 pub mod fallback;
 pub mod json;
+pub mod latex;
 pub mod markdown;
 #[cfg(feature = "lang-svelte")]
 pub mod svelte;
@@ -25,6 +26,7 @@ pub fn create_default_registry() -> ParserRegistry {
     registry.register(Box::new(toml_plugin::TomlParserPlugin));
     registry.register(Box::new(csv_plugin::CsvParserPlugin));
     registry.register(Box::new(markdown::MarkdownParserPlugin));
+    registry.register(Box::new(latex::LatexParserPlugin));
     #[cfg(feature = "lang-erb")]
     registry.register(Box::new(erb::ErbParserPlugin));
     // Fallback must be last
