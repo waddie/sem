@@ -9,6 +9,18 @@ pub struct SuppressedNestedEntity {
     pub child_entity_node_type: &'static str,
 }
 
+/// Strategy for stripping comments and string literals from source content.
+/// Controls which stripping function `strip_for_language` dispatches to in graph.rs.
+/// Add a new variant here when a language requires custom comment handling.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum StripStrategy {
+    /// Standard stripper: handles `//`, `/* */`, and `#` line comments, plus string literals.
+    Generic,
+    /// Clojure: blank double-quoted strings only (preserves `#` for gensyms and reader macros),
+    /// then strip `;` line comments in a second pass.
+    Clojure,
+}
+
 #[allow(dead_code)]
 pub struct LanguageConfig {
     pub id: &'static str,
@@ -16,6 +28,17 @@ pub struct LanguageConfig {
     pub entity_node_types: &'static [&'static str],
     pub container_node_types: &'static [&'static str],
     pub call_entity_identifiers: &'static [&'static str],
+    /// Extra characters (beyond alphanumeric and `_`) that are valid identifier
+    /// constituents for this language. Used by the tokenizer and reference scanner.
+    /// E.g. Clojure uses `['-', '?', '!', '*', '=']` for kebab-case, predicates,
+    /// bang functions, dynamic vars, and equality operators.
+    pub extra_ident_chars: &'static [char],
+    /// How to strip comments and string literals from content for this language.
+    pub strip_strategy: StripStrategy,
+    /// Whether this language uses `alias/name` qualified references (e.g. Clojure).
+    /// When true, `resolve_entity_references` runs a post-processing pass to resolve
+    /// these qualified calls via the import table.
+    pub has_slash_qualified_refs: bool,
     pub suppressed_nested_entities: &'static [SuppressedNestedEntity],
     /// Node types that introduce a new scope. The general (non-container) recursion
     /// in visit_node will not descend into these nodes, preventing local variables
@@ -329,6 +352,11 @@ fn get_haskell() -> Option<Language> {
     Some(tree_sitter_haskell::LANGUAGE.into())
 }
 
+#[cfg(feature = "lang-clojure")]
+fn get_clojure() -> Option<Language> {
+    Some(tree_sitter_clojure_orchard::LANGUAGE.into())
+}
+
 /// Inside JS/TS function bodies, suppress variable declarations so that local
 /// variables are not extracted as nested entities. Inner function/class
 /// declarations are still extracted for diff granularity.
@@ -471,6 +499,9 @@ static TYPESCRIPT_CONFIG: LanguageConfig = LanguageConfig {
         "statement_block",
     ],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: JS_TS_SUPPRESSED_NESTED,
     scope_boundary_types: JS_TS_SCOPE_BOUNDARIES,
     get_language: get_typescript,
@@ -509,6 +540,9 @@ static TSX_CONFIG: LanguageConfig = LanguageConfig {
         "statement_block",
     ],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: JS_TS_SUPPRESSED_NESTED,
     scope_boundary_types: JS_TS_SCOPE_BOUNDARIES,
     get_language: get_tsx,
@@ -531,6 +565,9 @@ static JAVASCRIPT_CONFIG: LanguageConfig = LanguageConfig {
     ],
     container_node_types: &["class_body", "statement_block"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: JS_TS_SUPPRESSED_NESTED,
     scope_boundary_types: JS_TS_SCOPE_BOUNDARIES,
     get_language: get_javascript,
@@ -548,6 +585,9 @@ static PYTHON_CONFIG: LanguageConfig = LanguageConfig {
     ],
     container_node_types: &["block"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_python,
@@ -567,6 +607,9 @@ static GO_CONFIG: LanguageConfig = LanguageConfig {
     ],
     container_node_types: &["block"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_go,
@@ -591,6 +634,9 @@ static RUST_CONFIG: LanguageConfig = LanguageConfig {
     ],
     container_node_types: &["declaration_list", "block"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_rust,
@@ -619,6 +665,9 @@ static JAVA_CONFIG: LanguageConfig = LanguageConfig {
         "block",
     ],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_java,
@@ -639,6 +688,9 @@ static C_CONFIG: LanguageConfig = LanguageConfig {
     ],
     container_node_types: &["compound_statement"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: C_SUPPRESSED_NESTED,
     scope_boundary_types: &[],
     get_language: get_c,
@@ -665,6 +717,9 @@ static CPP_CONFIG: LanguageConfig = LanguageConfig {
         "compound_statement",
     ],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: CPP_SUPPRESSED_NESTED,
     scope_boundary_types: CPP_SCOPE_BOUNDARIES,
     get_language: get_cpp,
@@ -678,6 +733,9 @@ static RUBY_CONFIG: LanguageConfig = LanguageConfig {
     entity_node_types: &["method", "singleton_method", "class", "module"],
     container_node_types: &["body_statement"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_ruby,
@@ -703,6 +761,9 @@ static CSHARP_CONFIG: LanguageConfig = LanguageConfig {
     ],
     container_node_types: &["declaration_list", "record_body", "block"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_csharp,
@@ -728,6 +789,9 @@ static PHP_CONFIG: LanguageConfig = LanguageConfig {
         "compound_statement",
     ],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_php,
@@ -748,6 +812,9 @@ static FORTRAN_CONFIG: LanguageConfig = LanguageConfig {
     ],
     container_node_types: &["module", "program", "internal_procedures"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_fortran,
@@ -781,6 +848,9 @@ static SWIFT_CONFIG: LanguageConfig = LanguageConfig {
         "computed_property",
     ],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: SWIFT_SUPPRESSED_NESTED,
     scope_boundary_types: &[],
     get_language: get_swift,
@@ -807,6 +877,9 @@ static ELIXIR_CONFIG: LanguageConfig = LanguageConfig {
         "defexception",
         "defdelegate",
     ],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_elixir,
@@ -820,6 +893,9 @@ static BASH_CONFIG: LanguageConfig = LanguageConfig {
     entity_node_types: &["function_definition"],
     container_node_types: &["compound_statement"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_bash,
@@ -833,6 +909,9 @@ static HCL_CONFIG: LanguageConfig = LanguageConfig {
     entity_node_types: &["block", "attribute"],
     container_node_types: &["body"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[SuppressedNestedEntity {
         parent_entity_node_type: "block",
         child_entity_node_type: "attribute",
@@ -857,6 +936,9 @@ static KOTLIN_CONFIG: LanguageConfig = LanguageConfig {
     ],
     container_node_types: &["class_body", "enum_class_body"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_kotlin,
@@ -873,6 +955,9 @@ static XML_CONFIG: LanguageConfig = LanguageConfig {
     entity_node_types: &["element"],
     container_node_types: &["content"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_xml,
@@ -897,6 +982,9 @@ static DART_CONFIG: LanguageConfig = LanguageConfig {
     ],
     container_node_types: &["class_body", "enum_body", "extension_body"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_dart,
@@ -910,6 +998,9 @@ static PERL_CONFIG: LanguageConfig = LanguageConfig {
     entity_node_types: &["subroutine_declaration_statement", "package_statement"],
     container_node_types: &["block"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_perl,
@@ -932,6 +1023,9 @@ static OCAML_CONFIG: LanguageConfig = LanguageConfig {
     ],
     container_node_types: &["structure", "module_binding"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_ocaml,
@@ -954,6 +1048,9 @@ static OCAML_INTERFACE_CONFIG: LanguageConfig = LanguageConfig {
     ],
     container_node_types: &["signature", "module_binding"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_ocaml_interface,
@@ -979,6 +1076,9 @@ static SCALA_CONFIG: LanguageConfig = LanguageConfig {
     ],
     container_node_types: &["template_body", "enum_body", "with_template_body"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_scala,
@@ -996,6 +1096,9 @@ static ZIG_CONFIG: LanguageConfig = LanguageConfig {
     ],
     container_node_types: &["block"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[SuppressedNestedEntity {
         parent_entity_node_type: "function_declaration",
         child_entity_node_type: "variable_declaration",
@@ -1012,6 +1115,9 @@ static NIX_CONFIG: LanguageConfig = LanguageConfig {
     entity_node_types: &["binding", "inherit", "inherit_from"],
     container_node_types: &["binding_set"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &[],
     get_language: get_nix,
@@ -1039,9 +1145,44 @@ static HASKELL_CONFIG: LanguageConfig = LanguageConfig {
     ],
     container_node_types: &["declarations", "class_body", "instance_body"],
     call_entity_identifiers: &[],
+    extra_ident_chars: &[],
+    strip_strategy: StripStrategy::Generic,
+    has_slash_qualified_refs: false,
     suppressed_nested_entities: &[],
     scope_boundary_types: &["function"],
     get_language: get_haskell,
+    scope_resolve: None,
+};
+
+// Clojure is a Lisp: all definition forms are `list_lit` nodes whose first named
+// child is a `sym_lit` identifying the macro (defn, ns, defrecord, etc.).
+// The entity extractor handles these via the list_lit branch in visit_node.
+#[cfg(feature = "lang-clojure")]
+static CLOJURE_CONFIG: LanguageConfig = LanguageConfig {
+    id: "clojure",
+    extensions: &[".clj", ".cljs", ".cljc"],
+    entity_node_types: &[],
+    container_node_types: &[],
+    call_entity_identifiers: &[
+        "def",
+        "defonce",
+        "defn",
+        "defn-",
+        "defmacro",
+        "defmulti",
+        "defmethod",
+        "defprotocol",
+        "defrecord",
+        "deftype",
+        "definterface",
+        "defstruct",
+    ],
+    extra_ident_chars: &['-', '?', '!', '*', '='],
+    strip_strategy: StripStrategy::Clojure,
+    has_slash_qualified_refs: true,
+    suppressed_nested_entities: &[],
+    scope_boundary_types: &[],
+    get_language: get_clojure,
     scope_resolve: None,
 };
 
@@ -2327,6 +2468,8 @@ macro_rules! all_configs {
             &NIX_CONFIG,
             #[cfg(feature = "lang-haskell")]
             &HASKELL_CONFIG,
+            #[cfg(feature = "lang-clojure")]
+            &CLOJURE_CONFIG,
         ]
     }};
 }
