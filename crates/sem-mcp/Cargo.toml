@@ -19,7 +19,7 @@ sem-core = { path = "../sem-core", version = "0.21.0" }
 sem-cloud-client = { path = "../sem-cloud-client", version = "0.21.0" }
 git2 = "0.20"
 lru = "0.16"
-rmcp = { version = "1", features = ["server", "transport-io"] }
+rmcp = { version = "2", features = ["server", "transport-io"] }
 tokio = { version = "1", features = ["full"] }
 zstd = "0.13"
 serde = { version = "1", features = ["derive"] }
